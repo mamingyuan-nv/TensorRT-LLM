@@ -794,6 +794,25 @@ class PyTorchModelEngine(ModelEngine):
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    def _get_mixed_warmup_requests(self) -> List[Tuple[int, int]]:
+        """Mixed context+generation warmup configs (JIT-spike mitigation).
+
+        A batch with >=1 context request bypasses CUDA graph (can_run_cuda_graph
+        requires num_context_requests==0) and runs eager, selecting trtllm-gen FMHA
+        kernels that pure-ctx / pure-gen warmup and CUDA-graph capture never compile;
+        the first such batch mid-run then pays a ~15s NVRTC JIT stall. Returns
+        (num_tokens, num_gen_requests) tuples (ctx tokens = num_tokens - num_gen)
+        spanning short/medium/long context to cover VarSeq vs MultiCtasKv kernels.
+        """
+        mixed_configs = []
+        gen_sizes = [g for g in (16, 32, 64, 128) if 1 <= g <= self.batch_size]
+        for g in gen_sizes:
+            for ctx_tokens in (1024, 4096, 12288):
+                num_tokens = g + ctx_tokens
+                if num_tokens <= self.max_num_tokens and (g + 1) <= self.batch_size:
+                    mixed_configs.append((num_tokens, g))
+        return list(dict.fromkeys(mixed_configs))
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -857,6 +876,70 @@ class PyTorchModelEngine(ModelEngine):
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
+
+
+        if os.environ.get("TLLM_WARMUP_LONGKV", "1") == "1":
+            long_kv = max(
+                self.max_seq_len - 1 - self._get_num_extra_decoding_steps(), 1)
+
+            kvm = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+            tpb = max(getattr(kvm, "tokens_per_block", 32), 1)
+            avail_blocks = kvm.get_num_free_blocks()
+            usable_blocks = max(int(avail_blocks * 0.95), 1)
+
+            gen_sizes = sorted({
+                n
+                for n in list(range(1, 33)) +
+                [48, 64, 96, 128, 192, 256, 384, 512]
+                if 1 <= n <= self.batch_size and n <= avail_blocks
+            })
+            longkv_configs = []
+            for n in gen_sizes:
+                kv_full = min(long_kv, max((usable_blocks // n) * tpb, tpb))
+                for kv in sorted({kv_full, max(kv_full // 2, tpb)}, reverse=True):
+                    if n * math.ceil(kv / tpb) <= avail_blocks:
+                        longkv_configs.append((n, n, kv))
+            longkv_configs = list(dict.fromkeys(longkv_configs))
+            # a couple mixed (ctx+gen) long-KV exercise the eager mixed-batch path
+            for n in (16, 28):
+                if n <= self.batch_size and (n + 2048) <= self.max_num_tokens \
+                        and (n * math.ceil(long_kv / tpb) + 64) <= avail_blocks:
+                    longkv_configs.append((n + 2048, n, long_kv))
+            logger.info(
+                f"[ModelEngine::warmup] JIT-spike mitigation: long-KV warmup "
+                f"(kv_len={long_kv}) configs (num_tokens,num_gen,gen_kv_len): "
+                f"{longkv_configs}")
+            with self.no_cuda_graph():
+                for num_tokens, num_gen, gkv in longkv_configs:
+                    try:
+                        with self._release_batch_context(
+                                self._create_warmup_request(
+                                    resource_manager, num_tokens, num_gen,
+                                    gen_kv_len=gkv), resource_manager) as batch:
+                            if batch is None and self.mapping.tp_size <= 1:
+                                continue
+                            self._assert_all_tp_ranks_have_warmup_batch(
+                                batch, num_tokens)
+                            if batch is None:
+                                logger.info(
+                                    f"[LONGKV-DIAG] cfg(nt={num_tokens},ngen={num_gen},"
+                                    f"kv={gkv}) -> SKIPPED (batch None, KV blocks)")
+                                continue
+                            logger.info(
+                                f"[LONGKV-DIAG] cfg(nt={num_tokens},ngen={num_gen},"
+                                f"kv={gkv}) -> RAN ngen={len(batch.generation_requests)}")
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+                    except torch.OutOfMemoryError:
+                        logger.warning(
+                            f"[ModelEngine::warmup] long-KV warmup OOM at "
+                            f"num_tokens={num_tokens} num_gen={num_gen}; skipping.")
+                    except Exception as e:
+                        logger.warning(
+                            f"[ModelEngine::warmup] long-KV warmup failed "
+                            f"(non-fatal, continuing): {e}")
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -1227,8 +1310,12 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager: ResourceManager,
             num_tokens: int,
             num_gen_requests: int,
-            least_requests: bool = True) -> Optional[ScheduledRequests]:
-        """Creates a generic dummy ScheduledRequests object for warmup."""
+            least_requests: bool = True,
+            gen_kv_len: int = 1) -> Optional[ScheduledRequests]:
+        """Creates a generic dummy ScheduledRequests object for warmup.
+
+        gen_kv_len: per-decode-request KV length (default 1; large warms long-KV gen kernels).
+        """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -1290,7 +1377,8 @@ class PyTorchModelEngine(ModelEngine):
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
                 num_left_over_tokens / kv_cache_manager.tokens_per_block
-            ) + num_gen_requests * self.max_beam_width
+            ) + num_gen_requests * math.ceil(
+                gen_kv_len / kv_cache_manager.tokens_per_block) * self.max_beam_width
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
@@ -1323,7 +1411,7 @@ class PyTorchModelEngine(ModelEngine):
                 list(
                     range(num_ctx_requests,
                           num_ctx_requests + num_gen_requests)),
-                token_nums=[1] * num_gen_requests,
+                token_nums=[gen_kv_len] * num_gen_requests,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 kv_reserve_draft_tokens=self.max_draft_loop_tokens,
